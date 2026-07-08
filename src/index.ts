@@ -452,6 +452,12 @@ export function __testGetBridgeIntegrityState(): { sharedSession: SessionState |
 	return { sharedSession };
 }
 
+/** Test hook: run the private session-sync state machine against the current
+ * (test-seeded) sharedSession. */
+export function __testSyncSharedSession(messages: Context["messages"], cwd: string): SyncResult {
+	return syncSharedSession(messages, cwd);
+}
+
 // --- Constants ---
 
 // Global key to prevent re-registration of the provider across module reloads.
@@ -1123,8 +1129,25 @@ function syncSharedSession(
 ): SyncResult {
 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
 
-	// REUSE path
-	if (sharedSession && !sharedSession.needsRebuild) {
+	// A cwd change means a DIFFERENT pi session took over this process (each
+	// Manta task runs in its own worktree and the daemon chdirs before the
+	// turn). The stored pointer belongs to the other task's conversation, so
+	// REUSE must be skipped and the rebuild must not touch (or reuse the UUID
+	// of) the other task's session file — same treatment as forceRotate.
+	const cwdChanged = sharedSession !== null && canonicalize(sharedSession.cwd) !== canonicalize(cwd);
+	if (cwdChanged) {
+		debug(`syncSharedSession: cwd changed (${sharedSession!.cwd} → ${cwd}) — foreign session pointer, rotating`);
+	}
+
+	// REUSE path. Also requires cursor ≤ priors: a brand-new pi session's
+	// history is SHORTER than the stored cursor, and `priorMessages.slice(cursor)`
+	// on a short array returns [] — indistinguishable from "in sync" — which
+	// silently --resume'd the previous task's conversation into the new task
+	// (observed as cross-card transcript bleed, DST-6144). A shrunk same-cwd
+	// history (compact / tree-nav) is already flagged via needsRebuild events,
+	// but when pi's history is shorter than the cursor for ANY reason, REBUILD
+	// from pi's current history is the only answer that can't leak.
+	if (sharedSession && !sharedSession.needsRebuild && !cwdChanged && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -1148,9 +1171,10 @@ function syncSharedSession(
 	const previousCursor = sharedSession?.cursor ?? 0;
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
-	// and for any tools that key off them. Skipped only when there's a
-	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// and for any tools that key off them. Skipped when there's a concurrent
+	// writer we shouldn't race (see forceRotate docs above) and when the
+	// pointer belongs to another cwd's task — its file must stay untouched.
+	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate && !cwdChanged;
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
 		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
@@ -1171,7 +1195,7 @@ function syncSharedSession(
 		const missedCount = priorMessages.length - previousCursor;
 		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
 	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
+		debug(`Case 4 ${cwdChanged ? "cwd-change" : "post-abort"}: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid ${cwdChanged ? "touching another task's session" : "race with orphan writer"}), ${session.messages.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
