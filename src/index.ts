@@ -15,7 +15,7 @@ import { FABLE_FALLBACK_MODEL_ID, FABLE_MODEL_ID, buildModels, fallbackModelForP
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, stackDepth, pushContext, popContext, runWithFreshTurnContext, isInTurnContext } from "./query-state.js";
+import { QueryContext, ctx, stackDepth, pushContext, popContext, runWithFreshTurnContext, isInTurnContext, currentTurnStore, registerActiveTurnStore, unregisterActiveTurnStore, runInActiveTurnStore } from "./query-state.js";
 import { findUnpairedToolUses, summarizeMissingToolNames, type MissingToolResult } from "./tool-pairing-audit.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
@@ -1791,6 +1791,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// AsyncLocalStorage slot so concurrent tasks don't share _ctx/contextStack.
 	// Reentrant subagent calls are already inside a slot and skip this.
 	if (!isInTurnContext()) {
+		// Pi calls the provider from ITS OWN async chain, so the follow-up calls
+		// of an in-flight query (tool-result delivery, steer/followUp) arrive
+		// OUTSIDE the slot created for the query's first call. Rejoin the single
+		// active turn's slot when one exists; a fresh slot here would make the
+		// in-flight query invisible (activeQuery=null) and every tool result
+		// "orphaned" — ending the turn empty while the CLI waits forever.
+		const routed = runInActiveTurnStore(() => streamClaudeAgentSdk(model, context, options));
+		if (routed.ran) return routed.result;
 		return runWithFreshTurnContext(() => streamClaudeAgentSdk(model, context, options));
 	}
 
@@ -2014,6 +2022,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const sdkQuery = query({ prompt, options: queryOptions });
 	ctx().activeQuery = sdkQuery;
 
+	// Register this turn's ALS store while the query is in flight so pi's
+	// out-of-scope follow-up calls (tool results, steers) can rejoin it — see
+	// the entry-point routing above. Top-level turns only: a reentrant subagent
+	// query already lives inside its parent's registered store.
+	const turnStore = currentTurnStore();
+	if (!isReentrant) registerActiveTurnStore(turnStore);
+
 	// 4. Capture context for abort handling (must be AFTER pushContext)
 	const abortCtx = ctx();
 
@@ -2187,6 +2202,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			ctx().currentPiStream = null;
 		})
 		.finally(() => {
+			if (!isReentrant) unregisterActiveTurnStore(turnStore);
 			streamIdleWatchdog?.dispose();
 			activeStreamIdleWatchdogs.delete(abortCtx);
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);

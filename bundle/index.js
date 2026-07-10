@@ -22617,6 +22617,22 @@ function runWithFreshTurnContext(fn) {
 function isInTurnContext() {
   return turnStorage.getStore() !== void 0;
 }
+var activeTurnStores = /* @__PURE__ */ new Set();
+function currentTurnStore() {
+  return turnStorage.getStore();
+}
+function registerActiveTurnStore(store) {
+  if (store) activeTurnStores.add(store);
+}
+function unregisterActiveTurnStore(store) {
+  if (store) activeTurnStores.delete(store);
+}
+function runInActiveTurnStore(fn) {
+  if (activeTurnStores.size !== 1) return { ran: false };
+  const store = activeTurnStores.values().next().value;
+  if (!store.ctx.activeQuery && !store.contextStack.some((c2) => c2.activeQuery)) return { ran: false };
+  return { ran: true, result: turnStorage.run(store, fn) };
+}
 
 // src/tool-pairing-audit.ts
 function contentBlocks(content) {
@@ -38945,6 +38961,8 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, cwd, bridgeConf
 }
 function streamClaudeAgentSdk(model, context, options) {
   if (!isInTurnContext()) {
+    const routed = runInActiveTurnStore(() => streamClaudeAgentSdk(model, context, options));
+    if (routed.ran) return routed.result;
     return runWithFreshTurnContext(() => streamClaudeAgentSdk(model, context, options));
   }
   const stream = newAssistantMessageEventStream();
@@ -39102,6 +39120,8 @@ function streamClaudeAgentSdk(model, context, options) {
   let streamIdleTimedOut = false;
   const sdkQuery = jA$({ prompt, options: queryOptions });
   ctx().activeQuery = sdkQuery;
+  const turnStore = currentTurnStore();
+  if (!isReentrant) registerActiveTurnStore(turnStore);
   const abortCtx = ctx();
   const requestAbort = () => {
     void sdkQuery.interrupt().catch(() => {
@@ -39255,6 +39275,7 @@ function streamClaudeAgentSdk(model, context, options) {
     ctx().currentPiStream?.end();
     ctx().currentPiStream = null;
   }).finally(() => {
+    if (!isReentrant) unregisterActiveTurnStore(turnStore);
     streamIdleWatchdog?.dispose();
     activeStreamIdleWatchdogs.delete(abortCtx);
     if (options?.signal) options.signal.removeEventListener("abort", onAbort);
