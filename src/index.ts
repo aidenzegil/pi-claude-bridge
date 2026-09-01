@@ -21,6 +21,7 @@ import { loadConfig, normalizeEffortLevel, recordProjectTrust, type Config } fro
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
+import { publishToolProgress } from "./tool-progress.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -1701,6 +1702,21 @@ async function consumeQuery(
 		const queryCtx = ctx();
 		activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
 		if (!queryCtx.turnOutput) continue;
+
+		// The SDK emits tool_progress while its MCP handler is waiting for Pi to
+		// execute a tool. At that point the assistant stream is deliberately null,
+		// so this must run before the currentPiStream guard below. Publish a
+		// process-local diagnostic heartbeat instead of mutating Pi's transcript.
+		if (message.type === "tool_progress") {
+			const progress = publishToolProgress(message, customToolNameToPi);
+			if (progress) {
+				debug(`consumeQuery: tool_progress ${progress.toolName} [${progress.toolUseId}] ${progress.elapsedSeconds}s`);
+			} else {
+				debug("consumeQuery: ignored malformed tool_progress");
+			}
+			continue;
+		}
+
 		if (!queryCtx.currentPiStream && !(message.type === "assistant" && queryCtx.turnSawToolCall)) continue;
 
 		switch (message.type) {
