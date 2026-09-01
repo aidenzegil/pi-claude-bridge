@@ -37594,6 +37594,24 @@ function jsonSchemaToZodShape(schema) {
   return shape;
 }
 
+// src/tool-progress.ts
+import { channel } from "node:diagnostics_channel";
+var TOOL_PROGRESS_CHANNEL = "pi-claude-bridge:tool-progress";
+var progressChannel = channel(TOOL_PROGRESS_CHANNEL);
+function publishToolProgress(message, customToolNameToPi) {
+  if (!message.tool_use_id || !message.tool_name) return null;
+  if (!Number.isFinite(message.elapsed_time_seconds) || message.elapsed_time_seconds < 0) return null;
+  const toolName = customToolNameToPi.get(message.tool_name) ?? customToolNameToPi.get(message.tool_name.toLowerCase()) ?? message.tool_name;
+  const progress = {
+    toolUseId: message.tool_use_id,
+    toolName,
+    elapsedSeconds: message.elapsed_time_seconds,
+    ...message.parent_tool_use_id ? { parentToolUseId: message.parent_tool_use_id } : {}
+  };
+  progressChannel.publish(progress);
+  return progress;
+}
+
 // src/index.ts
 var _piAi = piAi;
 var newAssistantMessageEventStream = typeof _piAi.createAssistantMessageEventStream === "function" ? _piAi.createAssistantMessageEventStream : () => new _piAi.AssistantMessageEventStream();
@@ -38880,6 +38898,15 @@ async function consumeQuery(sdkQuery, customToolNameToPi, model, cwd, bridgeConf
     const queryCtx = ctx();
     activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
     if (!queryCtx.turnOutput) continue;
+    if (message.type === "tool_progress") {
+      const progress = publishToolProgress(message, customToolNameToPi);
+      if (progress) {
+        debug(`consumeQuery: tool_progress ${progress.toolName} [${progress.toolUseId}] ${progress.elapsedSeconds}s`);
+      } else {
+        debug("consumeQuery: ignored malformed tool_progress");
+      }
+      continue;
+    }
     if (!queryCtx.currentPiStream && !(message.type === "assistant" && queryCtx.turnSawToolCall)) continue;
     switch (message.type) {
       case "stream_event":
