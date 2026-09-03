@@ -15,12 +15,13 @@ import { FABLE_FALLBACK_MODEL_ID, FABLE_MODEL_ID, buildModels, fallbackModelForP
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, stackDepth, pushContext, popContext, runWithFreshTurnContext, isInTurnContext } from "./query-state.js";
+import { QueryContext, ctx, stackDepth, pushContext, popContext, runWithFreshTurnContext, isInTurnContext, currentTurnStore, registerActiveTurnStore, unregisterActiveTurnStore, runInActiveTurnStore } from "./query-state.js";
 import { findUnpairedToolUses, summarizeMissingToolNames, type MissingToolResult } from "./tool-pairing-audit.js";
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
+import { publishToolProgress } from "./tool-progress.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -450,6 +451,12 @@ export function __testSetBridgeIntegrityState(state: { ui?: Pick<ExtensionUICont
 
 export function __testGetBridgeIntegrityState(): { sharedSession: SessionState | null } {
 	return { sharedSession };
+}
+
+/** Test hook: run the private session-sync state machine against the current
+ * (test-seeded) sharedSession. */
+export function __testSyncSharedSession(messages: Context["messages"], cwd: string): SyncResult {
+	return syncSharedSession(messages, cwd);
 }
 
 // --- Constants ---
@@ -1123,8 +1130,25 @@ function syncSharedSession(
 ): SyncResult {
 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
 
-	// REUSE path
-	if (sharedSession && !sharedSession.needsRebuild) {
+	// A cwd change means a DIFFERENT pi session took over this process (each
+	// Manta task runs in its own worktree and the daemon chdirs before the
+	// turn). The stored pointer belongs to the other task's conversation, so
+	// REUSE must be skipped and the rebuild must not touch (or reuse the UUID
+	// of) the other task's session file — same treatment as forceRotate.
+	const cwdChanged = sharedSession !== null && canonicalize(sharedSession.cwd) !== canonicalize(cwd);
+	if (cwdChanged) {
+		debug(`syncSharedSession: cwd changed (${sharedSession!.cwd} → ${cwd}) — foreign session pointer, rotating`);
+	}
+
+	// REUSE path. Also requires cursor ≤ priors: a brand-new pi session's
+	// history is SHORTER than the stored cursor, and `priorMessages.slice(cursor)`
+	// on a short array returns [] — indistinguishable from "in sync" — which
+	// silently --resume'd the previous task's conversation into the new task
+	// (observed as cross-card transcript bleed, DST-6144). A shrunk same-cwd
+	// history (compact / tree-nav) is already flagged via needsRebuild events,
+	// but when pi's history is shorter than the cursor for ANY reason, REBUILD
+	// from pi's current history is the only answer that can't leak.
+	if (sharedSession && !sharedSession.needsRebuild && !cwdChanged && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -1148,9 +1172,10 @@ function syncSharedSession(
 	const previousCursor = sharedSession?.cursor ?? 0;
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
-	// and for any tools that key off them. Skipped only when there's a
-	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// and for any tools that key off them. Skipped when there's a concurrent
+	// writer we shouldn't race (see forceRotate docs above) and when the
+	// pointer belongs to another cwd's task — its file must stay untouched.
+	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate && !cwdChanged;
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
 		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
@@ -1171,7 +1196,7 @@ function syncSharedSession(
 		const missedCount = priorMessages.length - previousCursor;
 		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
 	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
+		debug(`Case 4 ${cwdChanged ? "cwd-change" : "post-abort"}: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid ${cwdChanged ? "touching another task's session" : "race with orphan writer"}), ${session.messages.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
@@ -1677,6 +1702,21 @@ async function consumeQuery(
 		const queryCtx = ctx();
 		activeStreamIdleWatchdogs.get(queryCtx)?.noteChunk();
 		if (!queryCtx.turnOutput) continue;
+
+		// The SDK emits tool_progress while its MCP handler is waiting for Pi to
+		// execute a tool. At that point the assistant stream is deliberately null,
+		// so this must run before the currentPiStream guard below. Publish a
+		// process-local diagnostic heartbeat instead of mutating Pi's transcript.
+		if (message.type === "tool_progress") {
+			const progress = publishToolProgress(message, customToolNameToPi);
+			if (progress) {
+				debug(`consumeQuery: tool_progress ${progress.toolName} [${progress.toolUseId}] ${progress.elapsedSeconds}s`);
+			} else {
+				debug("consumeQuery: ignored malformed tool_progress");
+			}
+			continue;
+		}
+
 		if (!queryCtx.currentPiStream && !(message.type === "assistant" && queryCtx.turnSawToolCall)) continue;
 
 		switch (message.type) {
@@ -1767,6 +1807,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// AsyncLocalStorage slot so concurrent tasks don't share _ctx/contextStack.
 	// Reentrant subagent calls are already inside a slot and skip this.
 	if (!isInTurnContext()) {
+		// Pi calls the provider from ITS OWN async chain, so the follow-up calls
+		// of an in-flight query (tool-result delivery, steer/followUp) arrive
+		// OUTSIDE the slot created for the query's first call. Rejoin the single
+		// active turn's slot when one exists; a fresh slot here would make the
+		// in-flight query invisible (activeQuery=null) and every tool result
+		// "orphaned" — ending the turn empty while the CLI waits forever.
+		const routed = runInActiveTurnStore(() => streamClaudeAgentSdk(model, context, options));
+		if (routed.ran) return routed.result;
 		return runWithFreshTurnContext(() => streamClaudeAgentSdk(model, context, options));
 	}
 
@@ -1990,6 +2038,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const sdkQuery = query({ prompt, options: queryOptions });
 	ctx().activeQuery = sdkQuery;
 
+	// Register this turn's ALS store while the query is in flight so pi's
+	// out-of-scope follow-up calls (tool results, steers) can rejoin it — see
+	// the entry-point routing above. Top-level turns only: a reentrant subagent
+	// query already lives inside its parent's registered store.
+	const turnStore = currentTurnStore();
+	if (!isReentrant) registerActiveTurnStore(turnStore);
+
 	// 4. Capture context for abort handling (must be AFTER pushContext)
 	const abortCtx = ctx();
 
@@ -2163,6 +2218,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			ctx().currentPiStream = null;
 		})
 		.finally(() => {
+			if (!isReentrant) unregisterActiveTurnStore(turnStore);
 			streamIdleWatchdog?.dispose();
 			activeStreamIdleWatchdogs.delete(abortCtx);
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);

@@ -302,4 +302,46 @@ export function isInTurnContext(): boolean {
 export function resetStack(): void {
 	_fallbackCtx = new QueryContext();
 	_fallbackStack.length = 0;
+	activeTurnStores.clear();
+}
+
+// --- Active-turn delivery routing ---
+//
+// Pi invokes the provider from ITS OWN async chain: the ALS scope created for a
+// query's first streamSimple call does NOT cover pi's follow-up calls for that
+// same query (tool-result delivery, steer/followUp arrival). Without routing,
+// those entries land in a fresh empty context, the in-flight query is invisible
+// (activeQuery=null), every tool result looks "orphaned", and the turn ends with
+// an empty message while the CLI subprocess waits forever on its MCP handler.
+//
+// Top-level turns register their store while their query is active. When an
+// out-of-scope entry arrives and EXACTLY ONE turn is active, it rejoins that
+// turn's store — the serialized-turns case (Manta gates bridge turns; the pi CLI
+// runs one turn at a time). With zero or multiple active turns the mapping is
+// ambiguous and the caller falls back to a fresh context (pre-fix behavior).
+
+const activeTurnStores = new Set<TurnStore>();
+
+/** The current ALS store, as an opaque handle for register/unregister pairing
+ * across teardown callbacks. */
+export function currentTurnStore(): unknown {
+	return turnStorage.getStore();
+}
+
+export function registerActiveTurnStore(store: unknown): void {
+	if (store) activeTurnStores.add(store as TurnStore);
+}
+
+export function unregisterActiveTurnStore(store: unknown): void {
+	if (store) activeTurnStores.delete(store as TurnStore);
+}
+
+/** Runs fn inside the single active turn's store. Returns `{ran: false}` when
+ * zero or multiple turns are registered, or the single registered turn has no
+ * in-flight query — the caller should fall back to a fresh context. */
+export function runInActiveTurnStore<T>(fn: () => T): { ran: true; result: T } | { ran: false } {
+	if (activeTurnStores.size !== 1) return { ran: false };
+	const store: TurnStore = activeTurnStores.values().next().value!;
+	if (!store.ctx.activeQuery && !store.contextStack.some((c) => c.activeQuery)) return { ran: false };
+	return { ran: true, result: turnStorage.run(store, fn) };
 }
